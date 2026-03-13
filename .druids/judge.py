@@ -38,7 +38,9 @@ failure. If the output is ambiguous, investigate further before deciding.
 
 If things break, persist. Read tracebacks, fix the environment, try again. \
 Do not give up after one error. Do not mark a step as failed because of a \
-setup issue you can fix.
+setup issue you can fix. You have root access. If a tool is missing, install \
+it: `apt-get update && apt-get install -y docker.io` for Docker, `pip install` \
+for Python packages, etc. Install first, ask questions later.
 
 Commands may have explicit timeouts on their fence lines (```bash timeout=30). \
 If a timeout is specified, kill the command if it exceeds that time -- it \
@@ -46,19 +48,28 @@ means something is stuck. If a command blocks with no timeout, something is \
 wrong -- kill it and investigate. Background servers with & and use bounded \
 retries (curl --retry) instead of open-ended waits.
 
-When all steps are done, call the verdict tool with your result."""
+If you hit a fundamental environment blocker that prevents verification \
+even after trying to install dependencies (e.g. missing API keys or \
+credentials you cannot generate, Docker install fails because the VM \
+lacks kernel support, no network access), call the block tool via: \
+`druids tool block reason="<one sentence>"`
+
+When all steps are done, call the verdict tool via: \
+`druids tool verdict result=<pass|fail> reason="<one sentence>"`"""
 
 LEAD_PROMPT = """\
 Find and register regimen files for judging.
 
 1. Look for a .regimen/ directory. Check the current directory, \
 /home/agent/repo/, and /home/agent/. Use ls or find to locate it.
-2. Read each .md file in the .regimen/ directory. For each file, call the \
-register_file tool with the filename and full file content.
+2. Read each .md file in the .regimen/ directory. For each file, use the \
+druids CLI to call the register_file tool: \
+`druids tool register_file filename=<name> content=<content>`
 
 {scope_instruction}
 
-After registering all relevant files, call the ready tool."""
+After registering all relevant files, call the ready tool: \
+`druids tool ready`"""
 
 JUDGE_PROMPT = """\
 Judge the regimen file: {filename}
@@ -75,11 +86,13 @@ Judge the regimen file: {filename}
    c. Compare actual output to what the prose says to expect.
 2. If a command fails unexpectedly, debug it. Try again. Only count it as \
 a failure if the feature itself is broken, not the environment.
-3. After all steps, call the `verdict` tool:
-   - result="pass" if all steps produced expected output
-   - result="fail" if any step shows the feature is broken
-   - result="na" if you cannot determine (environment issues you cannot fix)
-   - reason: one sentence explaining your judgment
+3. If you hit a fundamental environment blocker that you cannot fix even \
+after trying to install things (missing API keys, credentials you cannot \
+generate), report it: \
+`druids tool block reason="<one sentence>"`
+4. After all steps, report your verdict: \
+`druids tool verdict result=pass reason="<one sentence>"` or \
+`druids tool verdict result=fail reason="<one sentence>"`
 
 Start now."""
 
@@ -118,7 +131,10 @@ async def program(ctx, spec="", scope="", files="", **kwargs):
 
         lead = await ctx.agent(
             "lead",
+            model="claude-sonnet-4-6",
             prompt=LEAD_PROMPT.format(scope_instruction=scope_instruction),
+            git="read",
+            working_directory="/home/agent/repo",
         )
 
         @lead.on("register_file")
@@ -147,13 +163,52 @@ async def program(ctx, spec="", scope="", files="", **kwargs):
     for filename, content in file_map.items():
         judge = await ctx.agent(
             f"judge-{filename.replace('.md', '')}",
+            model="claude-sonnet-4-6",
             prompt=JUDGE_PROMPT.format(filename=filename, content=content),
             system_prompt=JUDGE_SYSTEM,
         )
 
+        def check_done():
+            """Emit summary and call ctx.done if all judges have reported."""
+            if len(results) < total:
+                return
+
+            passed = sum(1 for v in results.values() if v["result"] == "pass")
+            failed = sum(1 for v in results.values() if v["result"] == "fail")
+            blocked = sum(1 for v in results.values() if v["result"] == "block")
+
+            lines = []
+            for f, v in sorted(results.items()):
+                lines.append(f"[{v['result'].upper()}] {f}: {v['reason']}")
+
+            parts = []
+            if passed:
+                parts.append(f"{passed} passed")
+            if failed:
+                parts.append(f"{failed} failed")
+            if blocked:
+                parts.append(f"{blocked} blocked")
+
+            summary = ", ".join(parts) + "\n\n" + "\n".join(lines)
+            ctx.done(summary)
+
+        @judge.on("block")
+        async def on_block(reason: str, _file=filename):
+            """Signal a fundamental environment blocker that prevents verification."""
+            results[_file] = {"result": "block", "reason": reason}
+
+            ctx.emit("block", {
+                "file": _file,
+                "reason": reason,
+                "progress": f"{len(results)}/{total}",
+            })
+
+            check_done()
+            return f"Block recorded for {_file}: {reason}"
+
         @judge.on("verdict")
         async def on_verdict(result: str, reason: str, _file=filename):
-            """Report your judgment. result must be pass, fail, or na."""
+            """Report your judgment. result must be pass or fail."""
             verdict = result.lower()
             results[_file] = {"result": verdict, "reason": reason}
 
@@ -164,26 +219,7 @@ async def program(ctx, spec="", scope="", files="", **kwargs):
                 "progress": f"{len(results)}/{total}",
             })
 
-            if len(results) == total:
-                passed = sum(1 for v in results.values() if v["result"] == "pass")
-                failed = sum(1 for v in results.values() if v["result"] == "fail")
-                na = sum(1 for v in results.values() if v["result"] == "na")
-
-                lines = []
-                for f, v in sorted(results.items()):
-                    lines.append(f"[{v['result'].upper()}] {f}: {v['reason']}")
-
-                parts = []
-                if passed:
-                    parts.append(f"{passed} passed")
-                if failed:
-                    parts.append(f"{failed} failed")
-                if na:
-                    parts.append(f"{na} na")
-
-                summary = ", ".join(parts) + "\n\n" + "\n".join(lines)
-                ctx.done(summary)
-
+            check_done()
             return f"Verdict recorded: [{verdict.upper()}] {reason}"
 
     await ctx.wait()
