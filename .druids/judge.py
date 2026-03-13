@@ -1,10 +1,18 @@
-"""Regimen judge program -- run verification files with agent judges.
+"""Regimen judge -- run .regimen/*.md verification files.
 
-Takes regimen file contents as args, spawns a judge agent per file,
-streams results back via events as each finishes.
+Two modes of operation:
+
+1. Discovery: a lead agent runs on the VM, reads .regimen/*.md from the
+   repo checkout, and registers files via a tool call. If scope is set,
+   the lead only picks matching files.
+
+2. Direct: the caller passes file contents as a JSON map in the files arg.
+   No lead agent is needed.
 
 Usage:
-    druids exec .druids/judge.py files='{"api.md": "# API\\n## Step 1\\n..."}'
+    druids exec .druids/judge.py                        # discover all
+    druids exec .druids/judge.py scope='custom tools'   # discover matching
+    druids exec .druids/judge.py files='{"a.md": "..."}'  # direct
 """
 
 JUDGE_SYSTEM = """\
@@ -40,6 +48,18 @@ retries (curl --retry) instead of open-ended waits.
 
 When all steps are done, call the verdict tool with your result."""
 
+LEAD_PROMPT = """\
+Find and register regimen files for judging.
+
+1. Look for a .regimen/ directory. Check the current directory, \
+/home/agent/repo/, and /home/agent/. Use ls or find to locate it.
+2. Read each .md file in the .regimen/ directory. For each file, call the \
+register_file tool with the filename and full file content.
+
+{scope_instruction}
+
+After registering all relevant files, call the ready tool."""
+
 JUDGE_PROMPT = """\
 Judge the regimen file: {filename}
 
@@ -49,14 +69,13 @@ Judge the regimen file: {filename}
 
 ## Instructions
 
-1. Save the file contents above to a local file.
-2. Follow each step in order. For each step:
+1. Follow each step in order. For each step:
    a. Read the prose description of what should happen.
    b. Run the bash commands shown.
    c. Compare actual output to what the prose says to expect.
-3. If a command fails unexpectedly, debug it. Try again. Only count it as \
+2. If a command fails unexpectedly, debug it. Try again. Only count it as \
 a failure if the feature itself is broken, not the environment.
-4. After all steps, call the `verdict` tool:
+3. After all steps, call the `verdict` tool:
    - result="pass" if all steps produced expected output
    - result="fail" if any step shows the feature is broken
    - result="na" if you cannot determine (environment issues you cannot fix)
@@ -65,31 +84,70 @@ a failure if the feature itself is broken, not the environment.
 Start now."""
 
 
-async def program(ctx, files="{}"):
-    """Run regimen files with parallel judge agents.
+async def program(ctx, spec="", scope="", files="", **kwargs):
+    """Run regimen verification files.
 
     Args:
-        files: JSON object mapping filename to file content.
+        spec: Passed through as context but not used for filtering.
+        scope: Optional text describing what to test. The lead agent uses
+            this to filter which .regimen/*.md files to register.
+        files: Optional JSON map of filename -> content. If provided,
+            skips discovery and judges these files directly.
     """
+    import asyncio
     import json
-    file_map = json.loads(files)
+
+    file_map = {}
+    results = {}
+
+    # -- Direct mode: files passed as JSON --
+    if files:
+        file_map = json.loads(files) if isinstance(files, str) else files
+
+    # -- Discovery mode: lead agent reads from VM --
+    if not file_map:
+        files_ready = asyncio.Event()
+
+        if scope:
+            scope_instruction = (
+                f"Only register files whose description is relevant to: {scope}\n"
+                "Skip files that are clearly unrelated."
+            )
+        else:
+            scope_instruction = "Register every .md file you find."
+
+        lead = await ctx.agent(
+            "lead",
+            prompt=LEAD_PROMPT.format(scope_instruction=scope_instruction),
+        )
+
+        @lead.on("register_file")
+        def on_register(filename: str, content: str):
+            """Register a regimen file for judging."""
+            file_map[filename] = content
+            return f"Registered {filename} ({len(content)} chars)"
+
+        @lead.on("ready")
+        def on_ready():
+            """Signal that all files have been registered."""
+            files_ready.set()
+            return f"Ready with {len(file_map)} file(s). Judges will be spawned."
+
+        await files_ready.wait()
 
     if not file_map:
-        ctx.done("No regimen files provided.")
+        ctx.done("No regimen files found.")
         return
 
     total = len(file_map)
-    results = {}
-
     ctx.emit("run_started", {"total": total, "files": list(file_map.keys())})
+
+    # -- Spawn judge agents --
 
     for filename, content in file_map.items():
         judge = await ctx.agent(
             f"judge-{filename.replace('.md', '')}",
-            prompt=JUDGE_PROMPT.format(
-                filename=filename,
-                content=content,
-            ),
+            prompt=JUDGE_PROMPT.format(filename=filename, content=content),
             system_prompt=JUDGE_SYSTEM,
         )
 
@@ -127,3 +185,5 @@ async def program(ctx, files="{}"):
                 ctx.done(summary)
 
             return f"Verdict recorded: [{verdict.upper()}] {reason}"
+
+    await ctx.wait()
